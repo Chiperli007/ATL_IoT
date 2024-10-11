@@ -1,0 +1,177 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// WiFi-Konfiguration
+const char* ssid = "WLANNAME";    // Name des WiFi-Netzwerks
+const char* password = "PASSWORT";  // WiFi-Passwort
+
+// Telegram Bot Konfiguration
+String botToken = "BOT-TOKEN"; // Token für deinen Telegram Bot
+String chat_id = "CHAT-ID";  // Chat-ID, an die die Nachrichten gesendet werden
+
+// Open-Meteo API Konfiguration
+const String weatherApiUrl = "https://api.open-meteo.com/v1/forecast?latitude=47.5227&longitude=7.6451&current_weather=true&timezone=Europe%2FBerlin";  // URL der Open-Meteo API für die Wetterdaten
+
+// Hall-Sensor Pin (GPIO-Pin, an den der Sensor angeschlossen ist)
+const int hallSensorPin = 10;  // Pin-Nummer für den Hall-Sensor
+
+// LED Pin (GPIO-Pin für die LED)
+const int ledPin = 2; // Pin für die LED, z.B. GPIO 2
+
+// Statusvariablen zur Vermeidung von doppelten Nachrichten und LED-Blinken
+bool alertSent = false;    // Merkt sich, ob eine Warnung bereits gesendet wurde
+bool isBlinking = false;   // Merkt sich, ob die LED gerade blinkt
+
+void setup() {
+  Serial.begin(115200);  // Initialisiert die serielle Kommunikation zur Ausgabe von Debug-Informationen
+
+  // Konfiguriert den Hall-Sensor-Pin als Eingang
+  pinMode(hallSensorPin, INPUT);
+
+  // Konfiguriert den LED-Pin als Ausgang und schaltet die LED standardmäßig aus
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Verbindet sich mit dem WiFi-Netzwerk
+  WiFi.begin(ssid, password);
+  // Wartet, bis die Verbindung hergestellt ist
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Verbinde mit WiFi...");
+  }
+  Serial.println("WiFi verbunden!");  // Bestätigt, dass WiFi verbunden ist
+}
+
+void loop() {
+  // Liest den Status des Hall-Sensors (LOW bedeutet Fenster offen)
+  bool isWindowOpen = digitalRead(hallSensorPin) == LOW;  
+
+  if (isWindowOpen) {  // Wenn das Fenster offen ist
+    Serial.println("Fenster ist offen, Wetter wird überprüft...");
+
+    if (WiFi.status() == WL_CONNECTED) {  // Überprüft, ob WiFi verbunden ist
+      HTTPClient http;
+      http.begin(weatherApiUrl);  // Beginnt die HTTP-Anfrage zur Open-Meteo API
+      int httpResponseCode = http.GET();  // Führt die GET-Anfrage aus
+
+      if (httpResponseCode > 0) {  // Überprüft, ob die Anfrage erfolgreich war
+        String payload = http.getString();  // Speichert die empfangenen Daten
+        Serial.println(payload);  // Gibt die empfangenen Daten in der Konsole aus
+
+        // Verarbeitet die empfangenen JSON-Daten
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (!error) {  // Wenn das JSON erfolgreich geparst wurde
+          // Liest Temperatur und Wettercode aus den JSON-Daten
+          float temperature = doc["current_weather"]["temperature"];
+          int weather_code = doc["current_weather"]["weathercode"];
+
+          Serial.print("Temperatur: ");
+          Serial.println(temperature);
+          Serial.print("Wettercode: ");
+          Serial.println(weather_code);
+
+          // Überprüft, ob es regnet (Wettercode 61-67 oder 80-82 bedeutet Regen)
+          if ((weather_code >= 61 && weather_code <= 67) || (weather_code >= 80 && weather_code <= 82)) {
+            Serial.println("Es regnet und das Fenster ist offen!");
+
+            // Startet das Blinken der LED, wenn sie noch nicht blinkt
+            if (!isBlinking) {
+              isBlinking = true;
+              startLedBlinking();  // Funktion, die das Blinken startet
+            }
+
+            // Sendet eine Telegram-Nachricht, wenn noch keine gesendet wurde
+            if (!alertSent) {
+              sendTelegramMessage("Achtung! Es regnet und das Fenster ist offen! Temperatur: " + String(temperature) + "°C");
+              alertSent = true;  // Markiert, dass die Nachricht gesendet wurde
+            }
+          } else {
+            Serial.println("Kein Regen.");
+            stopLedBlinking();  // Stoppt das Blinken, wenn es nicht regnet
+            alertSent = false;  // Setzt zurück, damit bei erneutem Regen eine Nachricht gesendet wird
+          }
+        } else {
+          Serial.print("Fehler beim Parsen des JSON: ");
+          Serial.println(error.c_str());  // Gibt den Fehler beim JSON-Parsen aus
+        }
+      } else {
+        Serial.print("Fehler bei der HTTP-Anfrage: ");
+        Serial.println(httpResponseCode);  // Gibt den HTTP-Fehlercode aus
+      }
+      http.end();  // Beendet die HTTP-Verbindung
+    }
+  } else {  // Wenn das Fenster geschlossen ist
+    Serial.println("Fenster ist geschlossen.");
+    stopLedBlinking();  // Stoppt das Blinken, wenn das Fenster geschlossen ist
+    alertSent = false;  // Setzt zurück, damit eine Nachricht gesendet werden kann, wenn das Fenster wieder geöffnet wird
+  }
+
+  delay(60000);  // 1 Minute Pause zwischen den Überprüfungen
+}
+
+// Funktion zum Starten des LED-Blinkens
+void startLedBlinking() {
+  while (isBlinking) {  // Solange die LED blinken soll
+    digitalWrite(ledPin, HIGH);   // Schaltet die LED ein
+    delay(500);                   // 500 ms warten
+    digitalWrite(ledPin, LOW);    // Schaltet die LED aus
+    delay(500);                   // 500 ms warten
+
+    // Während des Blinkens wird der Fensterstatus erneut überprüft
+    bool isWindowOpen = digitalRead(hallSensorPin) == LOW;
+    // Wenn das Fenster geschlossen ist oder es nicht mehr regnet, stoppt das Blinken
+    if (!isWindowOpen || !isRaining()) {
+      stopLedBlinking();
+      break;
+    }
+  }
+}
+
+// Funktion zum Stoppen des LED-Blinkens
+void stopLedBlinking() {
+  isBlinking = false;  // Setzt den Blinken-Status auf "aus"
+  digitalWrite(ledPin, LOW);  // Schaltet die LED aus
+}
+
+// Funktion zur Überprüfung, ob es regnet, basierend auf den aktuellen Wetterdaten
+bool isRaining() {
+  HTTPClient http;
+  http.begin(weatherApiUrl);  // Führt erneut eine HTTP-Anfrage zur Open-Meteo API aus
+  int httpResponseCode = http.GET();  // Führt die GET-Anfrage aus
+
+  if (httpResponseCode > 0) {  // Überprüft, ob die Anfrage erfolgreich war
+    String payload = http.getString();  // Speichert die empfangenen Daten
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, payload);  // Parst die JSON-Daten
+
+    if (!error) {  // Wenn das JSON erfolgreich geparst wurde
+      int weather_code = doc["current_weather"]["weathercode"];  // Liest den Wettercode
+      // Überprüft, ob der Wettercode für Regen steht
+      return (weather_code >= 61 && weather_code <= 67) || (weather_code >= 80 && weather_code <= 82);
+    }
+  }
+  return false;  // Wenn kein Regen erkannt wurde
+}
+
+// Funktion zum Senden einer Telegram-Nachricht
+void sendTelegramMessage(String message) {
+  if (WiFi.status() == WL_CONNECTED) {  // Wenn WiFi verbunden ist
+    HTTPClient http;
+    // Baut die URL zur Telegram Bot API mit der Nachricht und Chat-ID
+    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chat_id + "&text=" + message;
+
+    http.begin(url);  // Startet die HTTP-Anfrage
+    int httpResponseCode = http.GET();  // Führt die GET-Anfrage aus
+
+    if (httpResponseCode > 0) {  // Wenn die Anfrage erfolgreich war
+      Serial.println("Telegram Nachricht gesendet!");  // Bestätigt den Versand der Nachricht
+    } else {
+      Serial.print("Fehler bei der Telegram-Anfrage: ");
+      Serial.println(httpResponseCode);  // Gibt einen Fehler aus, wenn die Nachricht nicht gesendet wurde
+    }
+    http.end();  // Beendet die HTTP-Verbindung
+  }
+}
